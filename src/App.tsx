@@ -111,7 +111,7 @@ async function getSuggestionsForParagraph(
   // 1. Fetch from LanguageTool
   const ltMatches = await getSuggestionsFromLT(paragraphText);
 
-  // Map Slate nodes to calculate absolute offsets (reusing our mapping logic)
+  // Map Slate nodes to calculate absolute offsets correctly
   const paragraphTextNodes: Array<{ path: Path; text: string; start: number; end: number }> = [];
   let currentOffset = 0;
   for (const [n, p] of Node.texts(editor, { from: paragraphPath })) {
@@ -125,34 +125,29 @@ async function getSuggestionsForParagraph(
     currentOffset += text.length;
   }
 
-  const findPathAndOffset = (absOffset: number): { path: Path; offset: number } | null => {
-    for (const node of paragraphTextNodes) {
-      if (absOffset >= node.start && absOffset <= node.end) {
-        return { path: node.path, offset: absOffset - node.start };
-      }
-    }
-    return null;
-  };
-
-  // Process LT matches
+  // Process LT matches: Split them across text nodes if they span multiple
   for (const match of ltMatches) {
-    if (match.replacements.length === 0) continue;
+    const mStart = match.offset;
+    const mEnd = match.offset + match.length;
+    const suggestionId = uid();
 
-    const startPoint = findPathAndOffset(match.offset);
-    const endPoint = findPathAndOffset(match.offset + match.length);
+    for (const node of paragraphTextNodes) {
+      const intersectStart = Math.max(mStart, node.start);
+      const intersectEnd = Math.min(mEnd, node.end);
 
-    if (startPoint && endPoint) {
-      suggestions.push({
-        id: uid(),
-        kind: "grammar",
-        path: startPoint.path,
-        range: {
-          anchor: startPoint,
-          focus: endPoint,
-        },
-        replacement: match.replacements[0].value,
-        reason: match.message,
-      });
+      if (intersectStart < intersectEnd) {
+        suggestions.push({
+          id: suggestionId,
+          kind: "grammar",
+          path: node.path,
+          range: {
+            anchor: { path: node.path, offset: intersectStart - node.start },
+            focus: { path: node.path, offset: intersectEnd - node.start },
+          },
+          replacement: match.replacements[0]?.value || "",
+          reason: match.message,
+        });
+      }
     }
   }
 
@@ -360,6 +355,7 @@ function Leaf({ attributes, children, leaf }: RenderLeafProps) {
     const style: React.CSSProperties = {
       textDecoration: "underline",
       textDecorationStyle: "wavy",
+      textDecorationColor: kind === "grammar" ? "#ff4d4f" : "#13c2c2",
       cursor: "pointer",
     };
 
@@ -379,6 +375,7 @@ export default function App() {
   const editor = useMemo(() => withHistory(withReact(createEditor() as ReactEditor)), []);
   const [value, setValue] = useState<Descendant[]>(initialValue);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [loading, setLoading] = useState(false);
 
   // Keep a tiny debounce so it doesn't recompute on every single keystroke.
   const debounceRef = useRef<number | null>(null);
@@ -400,9 +397,14 @@ export default function App() {
       return;
     }
 
-    const [, paragraphPath] = paragraphEntry;
-    const next = await getSuggestionsForParagraph(editor, paragraphPath, selection);
-    setSuggestions(next);
+    setLoading(true);
+    try {
+      const [, paragraphPath] = paragraphEntry;
+      const next = await getSuggestionsForParagraph(editor, paragraphPath, selection);
+      setSuggestions(next);
+    } finally {
+      setLoading(false);
+    }
   }, [editor]);
 
   const scheduleRecompute = useCallback(() => {
@@ -520,6 +522,7 @@ export default function App() {
             decorate={decorate}
             renderLeaf={renderLeaf}
             onKeyDown={onKeyDown}
+            onSelect={scheduleRecompute}
             placeholder="Start writing…"
             style={{ minHeight: 170, outline: "none", lineHeight: 1.55, fontSize: 16 }}
           />
@@ -528,6 +531,7 @@ export default function App() {
 
       <div style={{ marginTop: 14 }}>
         <b>Suggestions</b> <span style={{ opacity: 0.65 }}>({suggestions.length})</span>
+        {loading && <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.5 }}>Checking grammar…</span>}
         <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
           {suggestions.slice(0, 10).map((s) => (
             <div
