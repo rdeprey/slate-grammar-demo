@@ -47,6 +47,14 @@ type Suggestion = {
   reason: string;
 };
 
+type CustomRule = {
+  id: string;
+  intent: string;
+  pattern: string; // The regex pattern
+  message: string;
+  replacement: string;
+};
+
 const initialValue: Descendant[] = [
   {
     type: "paragraph",
@@ -79,24 +87,39 @@ function uid() {
   return Math.random().toString(16).slice(2);
 }
 
-function getLocalGrammarSuggestions(text: string): any[] {
+function getLocalGrammarSuggestions(text: string, customRules: CustomRule[] = []): any[] {
   const matches: any[] = [];
 
-  // Rule: It were -> It was (Indicative mood check)
-  // We check if it's "It were" but NOT preceded by "if", "wish", "suppose", etc.
+  // 1. Core local rules (It were)
   const itWereRe = /(?<!\b(if|wish|suppose|that)\s+)\b(it|she|he)\b\s+(were)\b/gi;
   for (const m of text.matchAll(itWereRe)) {
     const start = m.index ?? 0;
     const subject = m[2];
-    const verb = m[3];
-    const offset = start + subject.length + (m[0].length - subject.length - verb.length);
-
     matches.push({
       message: `Use "was" for indicative statements with "${subject}".`,
       offset: start,
       length: m[0].length,
       replacements: [{ value: `${subject} was` }]
     });
+  }
+
+  // 2. User-defined "AI" rules
+  for (const rule of customRules) {
+    try {
+      const re = new RegExp(rule.pattern, "gi");
+      for (const m of text.matchAll(re)) {
+        const original = m[0];
+        const replacement = rule.replacement ? matchCase(rule.replacement, original) : "";
+        matches.push({
+          message: rule.message,
+          offset: m.index ?? 0,
+          length: original.length,
+          replacements: [{ value: replacement }]
+        });
+      }
+    } catch (e) {
+      console.error("Invalid custom rule pattern:", rule.pattern);
+    }
   }
 
   return matches;
@@ -125,7 +148,8 @@ async function getSuggestionsFromLT(text: string, language = "en-US"): Promise<a
 async function getSuggestionsForParagraph(
   editor: Editor,
   paragraphPath: Path,
-  selection: Range | null
+  selection: Range | null,
+  customRules: CustomRule[] = []
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const paragraphText = Node.string(Node.get(editor, paragraphPath));
@@ -134,8 +158,8 @@ async function getSuggestionsForParagraph(
   // 1. Fetch from LanguageTool
   const ltMatches = await getSuggestionsFromLT(paragraphText);
 
-  // 2. Local Fallbacks (for cases where the free API is over-cautious)
-  const localMatches = getLocalGrammarSuggestions(paragraphText);
+  // 2. Local & Custom Rules
+  const localMatches = getLocalGrammarSuggestions(paragraphText, customRules);
 
   // Map Slate nodes to calculate absolute offsets correctly
   const paragraphTextNodes: Array<{ path: Path; text: string; start: number; end: number }> = [];
@@ -404,6 +428,9 @@ export default function App() {
   const [value, setValue] = useState<Descendant[]>(initialValue);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [loading, setLoading] = useState(false);
+  const [customRules, setCustomRules] = useState<CustomRule[]>([]);
+  const [ruleIntent, setRuleIntent] = useState("");
+  const [isGenerating, setIsGenerating] = useState(false);
 
   // Keep a tiny debounce so it doesn't recompute on every single keystroke.
   const debounceRef = useRef<number | null>(null);
@@ -428,7 +455,7 @@ export default function App() {
     setLoading(true);
     try {
       const [, paragraphPath] = paragraphEntry;
-      const next = await getSuggestionsForParagraph(editor, paragraphPath, selection);
+      const next = await getSuggestionsForParagraph(editor, paragraphPath, selection, customRules);
       setSuggestions(next);
     } finally {
       setLoading(false);
@@ -523,6 +550,59 @@ export default function App() {
     [applySuggestion, editor, getSuggestionAtCursor]
   );
 
+  const handleAddRule = async () => {
+    if (!ruleIntent.trim()) return;
+    setIsGenerating(true);
+
+    // Simulate LLM Generation
+    // In a real app, this would be: 
+    // const res = await fetch("/api/generate-rule", { method: "POST", body: { intent: ruleIntent } })
+    await new Promise(r => setTimeout(r, 800));
+
+    let generatedPattern = "";
+    let message = "";
+    let replacement = "";
+
+    const lower = ruleIntent.toLowerCase();
+    if (lower.includes("avoid") || lower.includes("never use") || lower.includes("ban")) {
+      const match = ruleIntent.match(/(?:avoid|use|ban)\W+(['"])?(\w+)\1/i) || ruleIntent.match(/(?:avoid|use|ban)\W+(\w+)/i);
+      const word = match ? match[2] || match[1] : "word";
+      generatedPattern = `\\b${word}\\b`;
+      message = `Style Guide: Avoid using the word "${word}".`;
+    } else if (lower.includes("replace") || lower.includes("instead of")) {
+      const words = ruleIntent.match(/replace\s+(\w+)\s+with\s+(\w+)/i);
+      if (words) {
+        generatedPattern = `\\b${words[1]}\\b`;
+        message = `Style Guide: Use "${words[2]}" instead of "${words[1]}".`;
+        replacement = words[2];
+      } else {
+        generatedPattern = `\\bword\\b`;
+        message = "Custom style rule triggered.";
+      }
+    } else {
+      generatedPattern = `\\b${ruleIntent.split(' ').pop()}\\b`;
+      message = `Custom Rule: ${ruleIntent}`;
+    }
+
+    const newRule: CustomRule = {
+      id: uid(),
+      intent: ruleIntent,
+      pattern: generatedPattern,
+      message,
+      replacement
+    };
+
+    setCustomRules(prev => [...prev, newRule]);
+    setRuleIntent("");
+    setIsGenerating(false);
+    recomputeSuggestions();
+  };
+
+  const removeRule = (id: string) => {
+    setCustomRules(prev => prev.filter(r => r.id !== id));
+    recomputeSuggestions();
+  };
+
   const renderLeaf = useCallback((props: RenderLeafProps) => <Leaf {...props} />, []);
 
   return (
@@ -598,7 +678,62 @@ export default function App() {
         </div>
       </div>
 
-      <details style={{ marginTop: 14 }}>
+      <div style={{ marginTop: 24, padding: 16, background: "#f9f9f9", borderRadius: 12, border: "1px solid #eee" }}>
+        <h3 style={{ marginTop: 0 }}>AI Style Guide Generator</h3>
+        <p style={{ fontSize: 13, opacity: 0.7 }}>Describe a custom rule (e.g., "Avoid the word 'actually'" or "Replace 'utilize' with 'use'").</p>
+        <div style={{ display: "flex", gap: 10 }}>
+          <input
+            value={ruleIntent}
+            onChange={e => setRuleIntent(e.target.value)}
+            placeholder="Describe your rule..."
+            style={{ flex: 1, padding: "8px 12px", borderRadius: 8, border: "1px solid #ddd" }}
+          />
+          <button
+            onClick={handleAddRule}
+            disabled={isGenerating}
+            style={{
+              padding: "8px 16px",
+              borderRadius: 8,
+              border: "none",
+              background: "#13c2c2",
+              color: "white",
+              cursor: isGenerating ? "not-allowed" : "pointer"
+            }}
+          >
+            {isGenerating ? "Generating..." : "Generate Rule"}
+          </button>
+        </div>
+
+        {customRules.length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <div style={{ fontSize: 12, fontWeight: "bold", opacity: 0.5, marginBottom: 8 }}>ACTIVE RULES</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {customRules.map(rule => (
+                <div key={rule.id} style={{
+                  background: "white",
+                  border: "1px solid #ddd",
+                  borderRadius: 16,
+                  padding: "4px 12px",
+                  fontSize: 13,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8
+                }}>
+                  <span>{rule.intent}</span>
+                  <button
+                    onClick={() => removeRule(rule.id)}
+                    style={{ border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 16, lineHeight: 1, opacity: 0.5 }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <details style={{ marginTop: 24 }}>
         <summary>Current Slate value (debug)</summary>
         <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(value, null, 2)}</pre>
       </details>
