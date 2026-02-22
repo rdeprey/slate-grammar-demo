@@ -159,7 +159,8 @@ async function getSuggestionsForParagraph(
   paragraphPath: Path,
   selection: Range | null,
   customRules: CustomRule[] = [],
-  settings: Record<string, boolean> = {}
+  settings: Record<string, boolean> = {},
+  apiKey: string = ""
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const paragraphText = Node.string(Node.get(editor, paragraphPath));
@@ -219,12 +220,24 @@ async function getSuggestionsForParagraph(
     }
   }
 
-  // 2. Add local POV propagation (High priority for this demo)
-  const targetPOV = selection && settings.povPropagation ? inferTargetPOV(editor, paragraphPath, selection) : null;
+  // 2. Add POV propagation
+  const targetPOV = selection && settings.povPropagation ? await inferTargetPOV(editor, paragraphPath, selection, apiKey) : null;
   if (targetPOV) {
-    for (const node of paragraphTextNodes) {
-      suggestions.push(...getPOVPropagationSuggestions(node.text, node.path, targetPOV));
+    let povSuggestions: Suggestion[] = [];
+
+    // Check if we can use "True" Coreference Resolution via Gemini
+    if (apiKey) {
+      povSuggestions = await getCorefSuggestionsFromGemini(paragraphText, paragraphTextNodes, targetPOV, apiKey);
     }
+
+    // Fallback to heuristic if AI failed or no key
+    if (povSuggestions.length === 0) {
+      for (const node of paragraphTextNodes) {
+        povSuggestions.push(...getPOVPropagationSuggestions(node.text, node.path, targetPOV));
+      }
+    }
+
+    suggestions.push(...povSuggestions);
   }
 
   // Stable sort: earlier offsets first
@@ -318,13 +331,13 @@ const POV_MAP: Record<POV, Record<string, string>> = {
 };
 
 /**
- * Infer the "Target POV" by finding the pronoun nearest to the cursor.
+ * Infer the "Target POV" by finding the pronoun OR name nearest to the cursor.
  */
-function inferTargetPOV(editor: Editor, paragraphPath: Path, selection: Range): POV | null {
+async function inferTargetPOV(editor: Editor, paragraphPath: Path, selection: Range, apiKey?: string): Promise<POV | null> {
   const paragraphText = Node.string(Node.get(editor, paragraphPath));
   const cursor = selection.anchor;
 
-  // Convert Slate point to absolute offset in paragraph text
+  // Convert Slate point to absolute offset
   const paragraphTextNodes: Array<{ path: Path; text: string }> = [];
   for (const [n, p] of Node.texts(editor, { from: paragraphPath })) {
     paragraphTextNodes.push({ path: p, text: (n as Text).text });
@@ -339,6 +352,41 @@ function inferTargetPOV(editor: Editor, paragraphPath: Path, selection: Range): 
     absolute += t.text.length;
   }
 
+  // 1. Check for a Name at the cursor (priority for Smart Inference)
+  if (apiKey) {
+    // Extract a small window around the cursor to find a potential name
+    const windowStart = Math.max(0, absolute - 15);
+    const windowEnd = Math.min(paragraphText.length, absolute + 15);
+    const contextWindow = paragraphText.slice(windowStart, windowEnd);
+
+    // Find capitalized words in the window
+    const nameMatch = contextWindow.match(/\b[A-Z][a-z]+\b/);
+    if (nameMatch) {
+      try {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const name = nameMatch[0];
+
+        const prompt = `
+          Context: "${paragraphText}"
+          The user is currently editing the name "${name}". 
+          In the context of this writing, what is the most likely POV / pronoun set for this character?
+          Return ONLY one of: he, she, they.
+          If it is unclear or not a character, return "unknown".
+        `;
+
+        const result = await model.generateContent(prompt);
+        const pov = result.response.text().trim().toLowerCase();
+        if (["he", "she", "they"].includes(pov)) {
+          return pov as POV;
+        }
+      } catch (e) {
+        console.error("AI POV inference failed:", e);
+      }
+    }
+  }
+
+  // 2. Fallback to nearest pronoun heuristic
   const allRe = /\b(he|him|his|she|her|hers|they|them|their|theirs)\b/gi;
   let nearestPOV: POV | null = null;
   let minDistance = Infinity;
@@ -348,7 +396,6 @@ function inferTargetPOV(editor: Editor, paragraphPath: Path, selection: Range): 
     const token = m[0];
     const end = start + token.length;
 
-    // Distance calculation: 0 if cursor is inside/at boundaries of the token
     const distance = absolute < start ? start - absolute : absolute > end ? absolute - end : 0;
 
     if (distance < minDistance) {
@@ -398,6 +445,66 @@ function getPOVPropagationSuggestions(text: string, path: Path, target: POV): Su
   }
 
   return suggestions;
+}
+
+async function getCorefSuggestionsFromGemini(
+  text: string,
+  nodes: Array<{ path: Path; text: string; start: number; end: number }>,
+  targetPOV: POV,
+  apiKey: string
+): Promise<Suggestion[]> {
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+
+    const prompt = `
+      You are a Coreference Resolution engine for a creative writing tool.
+      Text: "${text}"
+      The user is writing about a character they want to use "${targetPOV}" pronouns for.
+      
+      Identify every pronoun in the text that refers to THIS SPECIFIC CHARACTER and should be aligned to "${targetPOV}". 
+      Ignore pronouns that refer to DIFFERENT characters, even if they currently match the same gender.
+      
+      Return ONLY a JSON array of objects:
+      [
+        { "offset": number, "length": number, "original": "string", "replacement": "the ${targetPOV} version" }
+      ]
+    `;
+
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+    const cleaned = responseText.replace(/```json|```/g, "").trim();
+    const matches = JSON.parse(cleaned);
+
+    const suggestions: Suggestion[] = [];
+    for (const match of matches) {
+      const mStart = match.offset;
+      const mEnd = match.offset + match.length;
+      const suggestionId = uid();
+
+      for (const node of nodes) {
+        const iStart = Math.max(mStart, node.start);
+        const iEnd = Math.min(mEnd, node.end);
+        if (iStart < iEnd) {
+          suggestions.push({
+            id: suggestionId,
+            kind: "pov-pronoun-propagation",
+            path: node.path,
+            range: {
+              anchor: { path: node.path, offset: iStart - node.start },
+              focus: { path: node.path, offset: iEnd - node.start },
+            },
+            replacement: matchTokenCase(match.replacement, match.original),
+            reason: `AI detected this pronoun belongs to the character you're rewriting as ${targetPOV}.`,
+          });
+        }
+      }
+    }
+    return suggestions;
+  } catch (e) {
+    console.error("Gemini Coref failed:", e);
+    return [];
+  }
 }
 
 function matchTokenCase(replacement: string, originalToken: string) {
@@ -450,7 +557,7 @@ export default function App() {
   const [customRules, setCustomRules] = useState<CustomRule[]>([]);
   const [ruleIntent, setRuleIntent] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
-  const [apiKey, setApiKey] = useState("");
+  const [apiKey, setApiKey] = useState(import.meta.env.VITE_GEMINI_API_KEY || "");
   const [ruleSettings, setRuleSettings] = useState({
     ltTypos: true,
     ltGrammar: true,
@@ -467,6 +574,7 @@ export default function App() {
     const { selection } = editor;
     if (!selection) {
       setSuggestions([]);
+      setPovSuggestions([]);
       return;
     }
 
@@ -477,13 +585,14 @@ export default function App() {
 
     if (!paragraphEntry) {
       setSuggestions([]);
+      setPovSuggestions([]);
       return;
     }
 
     setLoading(true);
     try {
       const [, paragraphPath] = paragraphEntry;
-      const all = await getSuggestionsForParagraph(editor, paragraphPath, selection, customRules, ruleSettings);
+      const all = await getSuggestionsForParagraph(editor, paragraphPath, selection, customRules, ruleSettings, apiKey);
 
       // Gate POV suggestions: Separate from immediate underlines
       const immediate = all.filter(s => s.kind !== "pov-pronoun-propagation");
@@ -494,7 +603,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [editor, customRules]);
+  }, [editor, customRules, ruleSettings, apiKey]);
 
   const scheduleRecompute = useCallback(() => {
     if (debounceRef.current) window.clearTimeout(debounceRef.current);
@@ -539,9 +648,6 @@ export default function App() {
     if (povSuggestions.length === 0) return;
 
     Editor.withoutNormalizing(editor, () => {
-      // Apply in reverse order to keep offsets valid if they were in the same node
-      // but since they are distinct tokens, we can just apply them.
-      // Better: Sort by path and offset descending
       const sorted = [...povSuggestions].sort((a, b) => {
         const pathCompare = Path.compare(a.path, b.path);
         if (pathCompare !== 0) return -pathCompare;
@@ -565,7 +671,9 @@ export default function App() {
     let after: { s: Suggestion; dist: number } | null = null;
     let before: { s: Suggestion; dist: number } | null = null;
 
-    for (const s of suggestions) {
+    const all = [...suggestions, ...povSuggestions];
+
+    for (const s of all) {
       if (!Path.equals(s.path, point.path)) continue;
       const start = Range.start(s.range);
       const dist = start.offset - point.offset;
@@ -578,7 +686,7 @@ export default function App() {
     }
 
     return after?.s ?? before?.s ?? null;
-  }, [editor, suggestions]);
+  }, [editor, suggestions, povSuggestions]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -929,11 +1037,6 @@ export default function App() {
         <summary>Current Slate value (debug)</summary>
         <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(value, null, 2)}</pre>
       </details>
-
-      <p style={{ marginTop: 16, opacity: 0.7, fontSize: 13 }}>
-        Note: POV propagation is a heuristic demo. In production, you’d heavily gate it (explicit user action, or
-        high-confidence “POV change” detection) to avoid changing pronouns that refer to different characters.
-      </p>
     </div>
   );
 }

@@ -1,5 +1,9 @@
 # Slate Grammar Suggestions Demo
 
+## Environment variables
+
+- `VITE_GEMINI_API_KEY`: Your Google Gemini API key
+
 ## Run
 ```bash
 npm install
