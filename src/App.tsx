@@ -42,8 +42,7 @@ type SuggestionKind =
 type Suggestion = {
   id: string;
   kind: SuggestionKind;
-  path: Path; // text node path
-  range: Range; // slate range in that text node
+  range: Range; // slate range (can span multiple nodes)
   replacement: string;
   reason: string;
 };
@@ -196,61 +195,50 @@ async function getSuggestionsForParagraph(
   const allMatches = [...ltMatches, ...localMatches];
 
   for (const match of allMatches) {
-    const mStart = match.offset;
-    const mEnd = match.offset + match.length;
-    const suggestionId = uid();
-
-    for (const node of paragraphTextNodes) {
-      const intersectStart = Math.max(mStart, node.start);
-      const intersectEnd = Math.min(mEnd, node.end);
-
-      if (intersectStart < intersectEnd) {
-        suggestions.push({
-          id: suggestionId,
-          kind: "grammar",
-          path: node.path,
-          range: {
-            anchor: { path: node.path, offset: intersectStart - node.start },
-            focus: { path: node.path, offset: intersectEnd - node.start },
-          },
-          replacement: match.replacements[0]?.value || "",
-          reason: match.message,
-        });
-      }
+    const range = getRangeFromOffsets(paragraphTextNodes, match.offset, match.offset + match.length);
+    if (range) {
+      suggestions.push({
+        id: uid(),
+        kind: "grammar",
+        range,
+        replacement: match.replacements[0]?.value || "",
+        reason: match.message,
+      });
     }
   }
 
   // 2. Add POV propagation
-  const targetPOV = selection && settings.povPropagation ? await inferTargetPOV(editor, paragraphPath, selection, apiKey) : null;
-  if (targetPOV) {
-    let povSuggestions: Suggestion[] = [];
+  if (settings.povPropagation) {
+    // Synchronously find the anchor word at the cursor
+    const anchor = getCharacterAnchorAtCursor(paragraphText, selection, paragraphTextNodes);
 
-    // Check if we can use "True" Coreference Resolution via Gemini
-    if (apiKey) {
-      povSuggestions = await getCorefSuggestionsFromGemini(paragraphText, paragraphTextNodes, targetPOV, apiKey);
-    }
-
-    // Fallback to heuristic if AI failed or no key
-    if (povSuggestions.length === 0) {
+    if (anchor && apiKey) {
+      // Single unified AI call (with caching)
+      const aiSuggestions = await getAIAlignmentForParagraph(paragraphText, paragraphTextNodes, anchor, apiKey);
+      suggestions.push(...aiSuggestions);
+    } else if (anchor && anchor.inferredPOV) {
+      // Offline/Local fallback logic
       for (const node of paragraphTextNodes) {
-        povSuggestions.push(...getPOVPropagationSuggestions(node.text, node.path, targetPOV));
+        suggestions.push(...getPOVPropagationSuggestions(node.text, node.path, anchor.inferredPOV));
       }
     }
-
-    suggestions.push(...povSuggestions);
   }
 
   // Stable sort: earlier offsets first
   suggestions.sort((a, b) => {
-    const ao = Range.start(a.range).offset;
-    const bo = Range.start(b.range).offset;
-    return ao - bo;
+    const as = Range.start(a.range);
+    const bs = Range.start(b.range);
+    const pathCompare = Path.compare(as.path, bs.path);
+    if (pathCompare !== 0) return pathCompare;
+    return as.offset - bs.offset;
   });
 
   // Light de-dupe
   const seen = new Set<string>();
   return suggestions.filter((s) => {
-    const key = `${s.path.join(",")}:${Range.start(s.range).offset}-${Range.end(s.range).offset}:${s.replacement}`;
+    const start = Range.start(s.range);
+    const end = Range.end(s.range);
+    const key = `${start.path.join(",")}:${start.offset}-${end.offset}:${s.replacement}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -333,91 +321,123 @@ const POV_MAP: Record<POV, Record<string, string>> = {
 /**
  * Infer the "Target POV" by finding the pronoun OR name nearest to the cursor.
  */
-async function inferTargetPOV(editor: Editor, paragraphPath: Path, selection: Range, apiKey?: string): Promise<POV | null> {
-  const paragraphText = Node.string(Node.get(editor, paragraphPath));
+/**
+ * Find the word the user is currently editing or focusing on.
+ */
+function getCharacterAnchorAtCursor(
+  text: string,
+  selection: Range | null,
+  nodes: Array<{ path: Path; start: number; end: number }>
+): { text: string; isName: boolean; inferredPOV?: POV } | null {
+  if (!selection) return null;
   const cursor = selection.anchor;
 
-  // Convert Slate point to absolute offset
-  const paragraphTextNodes: Array<{ path: Path; text: string }> = [];
-  for (const [n, p] of Node.texts(editor, { from: paragraphPath })) {
-    paragraphTextNodes.push({ path: p, text: (n as Text).text });
-  }
-
   let absolute = 0;
-  for (const t of paragraphTextNodes) {
-    if (Path.equals(t.path, cursor.path)) {
+  for (const node of nodes) {
+    if (Path.equals(node.path, cursor.path)) {
       absolute += cursor.offset;
       break;
     }
-    absolute += t.text.length;
+    absolute += (node.end - node.start);
   }
 
-  // 1. Check for a Name at the cursor (priority for Smart Inference)
-  if (apiKey) {
-    // Extract a small window around the cursor to find a potential name
-    const windowStart = Math.max(0, absolute - 15);
-    const windowEnd = Math.min(paragraphText.length, absolute + 15);
-    const contextWindow = paragraphText.slice(windowStart, windowEnd);
+  // Find full word at absolute offset
+  let start = absolute;
+  while (start > 0 && /\w/.test(text[start - 1])) start--;
+  let end = absolute;
+  while (end < text.length && /\w/.test(text[end])) end++;
 
-    // Find capitalized words in the window
-    const nameMatch = contextWindow.match(/\b[A-Z][a-z]+\b/);
-    if (nameMatch) {
-      try {
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const name = nameMatch[0];
+  const word = text.slice(start, end);
+  if (!word || word.length < 2) return null;
 
-        const prompt = `
-          Context: "${paragraphText}"
-          The user is currently editing the name "${name}". 
-          In the context of this writing, what is the most likely POV / pronoun set for this character?
-          Return ONLY one of: he, she, they.
-          If it is unclear or not a character, return "unknown".
-        `;
+  const isName = (word[0] === word[0].toUpperCase() && /[A-Z]/.test(word[0]));
 
-        const result = await model.generateContent(prompt);
-        const pov = result.response.text().trim().toLowerCase();
-        if (["he", "she", "they"].includes(pov)) {
-          return pov as POV;
-        }
-      } catch (e) {
-        console.error("AI POV inference failed:", e);
-      }
+  // Heuristic POV for offline fallback
+  let inferredPOV: POV | undefined;
+  const lower = word.toLowerCase();
+  for (const pov of Object.keys(PRONOUNS) as POV[]) {
+    if (PRONOUNS[pov].map[lower]) {
+      inferredPOV = pov;
+      break;
     }
   }
 
-  // 2. Fallback to nearest pronoun heuristic
-  const allRe = /\b(he|him|his|she|her|hers|they|them|their|theirs)\b/gi;
-  let nearestPOV: POV | null = null;
-  let minDistance = Infinity;
+  return { text: word, isName, inferredPOV };
+}
 
-  for (const m of paragraphText.matchAll(allRe)) {
-    const start = m.index ?? 0;
-    const token = m[0];
-    const end = start + token.length;
+// Result Cache: Key is "paragraphTextHash:anchorWord"
+const aiCache = new Map<string, Suggestion[]>();
 
-    const distance = absolute < start ? start - absolute : absolute > end ? absolute - end : 0;
+async function getAIAlignmentForParagraph(
+  text: string,
+  nodes: Array<{ path: Path; text: string; start: number; end: number }>,
+  anchor: { text: string; isName: boolean },
+  apiKey: string
+): Promise<Suggestion[]> {
+  // Simple cache key
+  const cacheKey = `${text.length}:${text.slice(0, 50)}:${anchor.text}`;
+  if (aiCache.has(cacheKey)) return aiCache.get(cacheKey)!;
 
-    if (distance < minDistance) {
-      minDistance = distance;
-      const lower = token.toLowerCase();
-      for (const pov of Object.keys(PRONOUNS) as POV[]) {
-        if (PRONOUNS[pov].map[lower]) {
-          nearestPOV = pov;
-          break;
-        }
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+    const prompt = `
+      Paragraph: "${text}"
+      The user is focused on the character "${anchor.text}".
+      
+      Tasks:
+      1. Determine if "${anchor.text}" is a character and what their pronouns should be (he, she, or they).
+      2. Identify every OTHER pronoun in this paragraph that refers to THIS character.
+      
+      Return ONLY a JSON object:
+      {
+        "pov": "he" | "she" | "they" | "unknown",
+        "pronouns": [
+          { "offset": number, "length": number, "original": "string", "replacement": "string" }
+        ]
+      }
+    `;
+
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return [];
+
+    const data = JSON.parse(jsonMatch[0]);
+    if (data.pov === "unknown") return [];
+
+    const suggestions: Suggestion[] = [];
+    for (const match of data.pronouns || []) {
+      const range = getRangeFromOffsets(nodes, match.offset, match.offset + match.length);
+      if (range) {
+        suggestions.push({
+          id: uid(),
+          kind: "pov-pronoun-propagation",
+          range,
+          replacement: matchTokenCase(match.replacement, match.original),
+          reason: `AI detected this refers to character "${anchor.text}" (POV: ${data.pov}).`,
+        });
       }
     }
-  }
 
-  return nearestPOV;
+    aiCache.set(cacheKey, suggestions);
+    return suggestions;
+  } catch (e) {
+    console.error("AI alignment failed:", e);
+    return [];
+  }
+}
+
+function matchTokenCase(replacement: string, originalToken: string) {
+  if (originalToken[0] === originalToken[0].toUpperCase()) {
+    return replacement[0].toUpperCase() + replacement.slice(1);
+  }
+  return replacement;
 }
 
 function getPOVPropagationSuggestions(text: string, path: Path, target: POV): Suggestion[] {
   const suggestions: Suggestion[] = [];
-
-  // Find any non-target gendered pronouns and propose a replacement.
-  // We'll look for all pronouns across all sets, then map to target.
   const allRe = /\b(he|him|his|she|her|hers|they|them|their|theirs)\b/gi;
 
   for (const m of text.matchAll(allRe)) {
@@ -425,7 +445,6 @@ function getPOVPropagationSuggestions(text: string, path: Path, target: POV): Su
     const token = m[0];
     const lower = token.toLowerCase();
 
-    // If it's already in the target set, skip.
     if (PRONOUNS[target].map[lower]) continue;
 
     const mapped = POV_MAP[target][lower];
@@ -434,7 +453,6 @@ function getPOVPropagationSuggestions(text: string, path: Path, target: POV): Su
     suggestions.push({
       id: uid(),
       kind: "pov-pronoun-propagation",
-      path,
       range: {
         anchor: { path, offset: start },
         focus: { path, offset: start + token.length },
@@ -447,72 +465,25 @@ function getPOVPropagationSuggestions(text: string, path: Path, target: POV): Su
   return suggestions;
 }
 
-async function getCorefSuggestionsFromGemini(
-  text: string,
-  nodes: Array<{ path: Path; text: string; start: number; end: number }>,
-  targetPOV: POV,
-  apiKey: string
-): Promise<Suggestion[]> {
-  try {
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+function getRangeFromOffsets(
+  nodes: Array<{ path: Path; start: number; end: number }>,
+  start: number,
+  end: number
+): Range | null {
+  let anchor: Point | null = null;
+  let focus: Point | null = null;
 
-    const prompt = `
-      You are a Coreference Resolution engine for a creative writing tool.
-      Text: "${text}"
-      The user is writing about a character they want to use "${targetPOV}" pronouns for.
-      
-      Identify every pronoun in the text that refers to THIS SPECIFIC CHARACTER and should be aligned to "${targetPOV}". 
-      Ignore pronouns that refer to DIFFERENT characters, even if they currently match the same gender.
-      
-      Return ONLY a JSON array of objects:
-      [
-        { "offset": number, "length": number, "original": "string", "replacement": "the ${targetPOV} version" }
-      ]
-    `;
-
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-    const cleaned = responseText.replace(/```json|```/g, "").trim();
-    const matches = JSON.parse(cleaned);
-
-    const suggestions: Suggestion[] = [];
-    for (const match of matches) {
-      const mStart = match.offset;
-      const mEnd = match.offset + match.length;
-      const suggestionId = uid();
-
-      for (const node of nodes) {
-        const iStart = Math.max(mStart, node.start);
-        const iEnd = Math.min(mEnd, node.end);
-        if (iStart < iEnd) {
-          suggestions.push({
-            id: suggestionId,
-            kind: "pov-pronoun-propagation",
-            path: node.path,
-            range: {
-              anchor: { path: node.path, offset: iStart - node.start },
-              focus: { path: node.path, offset: iEnd - node.start },
-            },
-            replacement: matchTokenCase(match.replacement, match.original),
-            reason: `AI detected this pronoun belongs to the character you're rewriting as ${targetPOV}.`,
-          });
-        }
-      }
+  for (const node of nodes) {
+    if (start >= node.start && start < node.end) {
+      anchor = { path: node.path, offset: start - node.start };
     }
-    return suggestions;
-  } catch (e) {
-    console.error("Gemini Coref failed:", e);
-    return [];
+    if (end > node.start && end <= node.end) {
+      focus = { path: node.path, offset: end - node.start };
+    }
   }
-}
 
-function matchTokenCase(replacement: string, originalToken: string) {
-  // Preserve capitalization for sentence-start tokens.
-  if (originalToken[0] === originalToken[0].toUpperCase()) {
-    return replacement[0].toUpperCase() + replacement.slice(1);
-  }
-  return replacement;
+  if (anchor && focus) return { anchor, focus };
+  return null;
 }
 
 // ------------------- Slate leaf rendering (decorations) ------------------
@@ -609,7 +580,7 @@ export default function App() {
     if (debounceRef.current) window.clearTimeout(debounceRef.current);
     debounceRef.current = window.setTimeout(async () => {
       await recomputeSuggestions();
-    }, 400); // Slightly longer debounce for API calls
+    }, 1000); // 1s Debounce to respect Gemini API limits
   }, [recomputeSuggestions]);
 
   const decorate = useCallback(
@@ -620,9 +591,14 @@ export default function App() {
       const all = [...suggestions, ...povSuggestions];
 
       for (const s of all) {
-        if (Path.equals(s.path, path)) {
+        const intersection = Range.intersection(s.range, {
+          anchor: Editor.start(editor, path),
+          focus: Editor.end(editor, path),
+        });
+
+        if (intersection) {
           ranges.push({
-            ...s.range,
+            ...intersection,
             suggestionId: s.id,
             suggestionKind: s.kind,
           } as any);
@@ -630,7 +606,7 @@ export default function App() {
       }
       return ranges;
     },
-    [suggestions, povSuggestions]
+    [editor, suggestions, povSuggestions]
   );
 
   const applySuggestion = useCallback(
@@ -649,9 +625,11 @@ export default function App() {
 
     Editor.withoutNormalizing(editor, () => {
       const sorted = [...povSuggestions].sort((a, b) => {
-        const pathCompare = Path.compare(a.path, b.path);
+        const as = Range.start(a.range);
+        const bs = Range.start(b.range);
+        const pathCompare = Path.compare(as.path, bs.path);
         if (pathCompare !== 0) return -pathCompare;
-        return b.range.anchor.offset - a.range.anchor.offset;
+        return bs.offset - as.offset;
       });
 
       for (const s of sorted) {
@@ -667,25 +645,14 @@ export default function App() {
 
     const point = selection.anchor;
 
-    // Prefer suggestions in the same text node as cursor; nearest forward, else nearest backward.
-    let after: { s: Suggestion; dist: number } | null = null;
-    let before: { s: Suggestion; dist: number } | null = null;
-
     const all = [...suggestions, ...povSuggestions];
 
     for (const s of all) {
-      if (!Path.equals(s.path, point.path)) continue;
-      const start = Range.start(s.range);
-      const dist = start.offset - point.offset;
-      if (dist >= 0) {
-        if (!after || dist < after.dist) after = { s, dist };
-      } else {
-        const bdist = Math.abs(dist);
-        if (!before || bdist < before.dist) before = { s, dist: bdist };
+      if (Range.includes(s.range, point)) {
+        return s;
       }
     }
-
-    return after?.s ?? before?.s ?? null;
+    return null;
   }, [editor, suggestions, povSuggestions]);
 
   const onKeyDown = useCallback(
@@ -723,7 +690,7 @@ export default function App() {
 
       if (apiKey) {
         const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
         const prompt = `
           You are a LanguageTool Rule Specialist. 
