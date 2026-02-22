@@ -35,10 +35,7 @@ declare module "slate" {
  */
 
 type SuggestionKind =
-  | "repeat-word"
-  | "a-an"
-  | "double-space"
-  | "cap-after-period"
+  | "grammar"
   | "pov-pronoun-propagation";
 
 type Suggestion = {
@@ -82,131 +79,99 @@ function uid() {
   return Math.random().toString(16).slice(2);
 }
 
-// ------------------------- Cheap rule engine -----------------------------
+// ------------------------- Grammar engine (Hybrid) ----------------------------
 
-function getSuggestionsForParagraph(
+async function getSuggestionsFromLT(text: string, language = "en-US"): Promise<any[]> {
+  try {
+    const params = new URLSearchParams();
+    params.append("text", text);
+    params.append("language", language);
+
+    const response = await fetch("https://api.languagetool.org/v2/check", {
+      method: "POST",
+      body: params,
+    });
+    const data = await response.json();
+    return data.matches || [];
+  } catch (err) {
+    console.error("LanguageTool API error:", err);
+    return [];
+  }
+}
+
+async function getSuggestionsForParagraph(
   editor: Editor,
   paragraphPath: Path,
   selection: Range | null
-): Suggestion[] {
+): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
+  const paragraphText = Node.string(Node.get(editor, paragraphPath));
+  if (!paragraphText.trim()) return [];
 
-  // Determine the "target POV" by finding the pronoun nearest to the cursor.
-  // This implements the "Cursor as Source of Truth" pattern: if you edit or 
-  // touch a pronoun, we assume that's the POV you want for this context.
-  const targetPOV = selection ? inferTargetPOV(editor, paragraphPath, selection) : null;
+  // 1. Fetch from LanguageTool
+  const ltMatches = await getSuggestionsFromLT(paragraphText);
 
-  // Walk all text nodes inside this paragraph
-  for (const [node, path] of Node.texts(editor, { from: paragraphPath })) {
-    const text = node.text;
-    if (!text) continue;
+  // Map Slate nodes to calculate absolute offsets (reusing our mapping logic)
+  const paragraphTextNodes: Array<{ path: Path; text: string; start: number; end: number }> = [];
+  let currentOffset = 0;
+  for (const [n, p] of Node.texts(editor, { from: paragraphPath })) {
+    const text = (n as Text).text;
+    paragraphTextNodes.push({
+      path: p,
+      text: text,
+      start: currentOffset,
+      end: currentOffset + text.length,
+    });
+    currentOffset += text.length;
+  }
 
-    // 1) repeated words: "the the"
-    const repeatRe = /\b([A-Za-z]+)\b(\s+)\b\1\b/g;
-    for (const m of text.matchAll(repeatRe)) {
-      const word = m[1];
-      const start = m.index ?? 0;
-      const secondWordStart = start + word.length + m[2].length;
-
-      suggestions.push({
-        id: uid(),
-        kind: "repeat-word",
-        path,
-        range: {
-          anchor: { path, offset: secondWordStart },
-          focus: { path, offset: secondWordStart + word.length },
-        },
-        replacement: "",
-        reason: `Remove repeated word "${word}".`,
-      });
-    }
-
-    // 2) double spaces: "  " -> " "
-    const dblSpaceRe = / {2,}/g;
-    for (const m of text.matchAll(dblSpaceRe)) {
-      const start = m.index ?? 0;
-      const len = m[0].length;
-      suggestions.push({
-        id: uid(),
-        kind: "double-space",
-        path,
-        range: {
-          anchor: { path, offset: start },
-          focus: { path, offset: start + len },
-        },
-        replacement: " ",
-        reason: "Replace multiple spaces with a single space.",
-      });
-    }
-
-    // 3) sentence capitalization after period: ". it" -> ". It"
-    const capRe = /([.!?])(\s+)([a-z])/g;
-    for (const m of text.matchAll(capRe)) {
-      const start = m.index ?? 0;
-      const punct = m[1];
-      const spaces = m[2];
-      const letter = m[3];
-      const letterOffset = start + punct.length + spaces.length;
-
-      suggestions.push({
-        id: uid(),
-        kind: "cap-after-period",
-        path,
-        range: {
-          anchor: { path, offset: letterOffset },
-          focus: { path, offset: letterOffset + 1 },
-        },
-        replacement: letter.toUpperCase(),
-        reason: "Capitalize the start of the sentence.",
-      });
-    }
-
-    // 4) a/an heuristic: "a apple" -> "an apple", "an banana" -> "a banana"
-    // Heuristic only (vowel-start word), not phonetics.
-    const articleRe = /\b(a|an)\s+([A-Za-z]+)/gi;
-    for (const m of text.matchAll(articleRe)) {
-      const start = m.index ?? 0;
-      const article = m[1];
-      const nextWord = m[2];
-
-      const nextLower = nextWord.toLowerCase();
-      const startsWithVowel = /^[aeiou]/.test(nextLower);
-      const desired = startsWithVowel ? "an" : "a";
-
-      if (article.toLowerCase() !== desired) {
-        suggestions.push({
-          id: uid(),
-          kind: "a-an",
-          path,
-          range: {
-            anchor: { path, offset: start },
-            focus: { path, offset: start + article.length },
-          },
-          replacement: matchCase(desired, article),
-          reason: `Use "${desired}" before "${nextWord}" (heuristic).`,
-        });
+  const findPathAndOffset = (absOffset: number): { path: Path; offset: number } | null => {
+    for (const node of paragraphTextNodes) {
+      if (absOffset >= node.start && absOffset <= node.end) {
+        return { path: node.path, offset: absOffset - node.start };
       }
     }
+    return null;
+  };
 
-    // 5) POV / pronoun propagation (he ↔ she ↔ they)
-    // This is a best-effort demo. In a real product you'd gate this heavily
-    // (e.g. only when user explicitly changes POV or confirms intent).
-    if (targetPOV) {
-      suggestions.push(...getPOVPropagationSuggestions(text, path, targetPOV));
+  // Process LT matches
+  for (const match of ltMatches) {
+    if (match.replacements.length === 0) continue;
+
+    const startPoint = findPathAndOffset(match.offset);
+    const endPoint = findPathAndOffset(match.offset + match.length);
+
+    if (startPoint && endPoint) {
+      suggestions.push({
+        id: uid(),
+        kind: "grammar",
+        path: startPoint.path,
+        range: {
+          anchor: startPoint,
+          focus: endPoint,
+        },
+        replacement: match.replacements[0].value,
+        reason: match.message,
+      });
     }
   }
 
-  // Stable sort: earlier offsets first, then shorter edits first.
+  // 2. Add local POV propagation (High priority for this demo)
+  const targetPOV = selection ? inferTargetPOV(editor, paragraphPath, selection) : null;
+  if (targetPOV) {
+    for (const node of paragraphTextNodes) {
+      suggestions.push(...getPOVPropagationSuggestions(node.text, node.path, targetPOV));
+    }
+  }
+
+  // Stable sort: earlier offsets first
   suggestions.sort((a, b) => {
     const ao = Range.start(a.range).offset;
     const bo = Range.start(b.range).offset;
-    if (ao !== bo) return ao - bo;
-    const al = Range.end(a.range).offset - ao;
-    const bl = Range.end(b.range).offset - bo;
-    return al - bl;
+    return ao - bo;
   });
 
-  // Light de-dupe (same path + same range + same replacement)
+  // Light de-dupe
   const seen = new Set<string>();
   return suggestions.filter((s) => {
     const key = `${s.path.join(",")}:${Range.start(s.range).offset}-${Range.end(s.range).offset}:${s.replacement}`;
@@ -418,7 +383,7 @@ export default function App() {
   // Keep a tiny debounce so it doesn't recompute on every single keystroke.
   const debounceRef = useRef<number | null>(null);
 
-  const recomputeSuggestions = useCallback(() => {
+  const recomputeSuggestions = useCallback(async () => {
     const { selection } = editor;
     if (!selection) {
       setSuggestions([]);
@@ -436,15 +401,15 @@ export default function App() {
     }
 
     const [, paragraphPath] = paragraphEntry;
-    const next = getSuggestionsForParagraph(editor, paragraphPath, selection);
+    const next = await getSuggestionsForParagraph(editor, paragraphPath, selection);
     setSuggestions(next);
   }, [editor]);
 
   const scheduleRecompute = useCallback(() => {
     if (debounceRef.current) window.clearTimeout(debounceRef.current);
-    debounceRef.current = window.setTimeout(() => {
-      recomputeSuggestions();
-    }, 200);
+    debounceRef.current = window.setTimeout(async () => {
+      await recomputeSuggestions();
+    }, 400); // Slightly longer debounce for API calls
   }, [recomputeSuggestions]);
 
   const decorate = useCallback(
@@ -545,10 +510,10 @@ export default function App() {
           onChange={(next) => {
             // Debounce the state update for the debug view to avoid lag
             if (debounceRef.current) window.clearTimeout(debounceRef.current);
-            debounceRef.current = window.setTimeout(() => {
+            debounceRef.current = window.setTimeout(async () => {
               setValue(next);
-              recomputeSuggestions();
-            }, 50);
+              await recomputeSuggestions();
+            }, 400);
           }}
         >
           <Editable
