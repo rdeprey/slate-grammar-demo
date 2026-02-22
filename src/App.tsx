@@ -79,6 +79,29 @@ function uid() {
   return Math.random().toString(16).slice(2);
 }
 
+function getLocalGrammarSuggestions(text: string): any[] {
+  const matches: any[] = [];
+
+  // Rule: It were -> It was (Indicative mood check)
+  // We check if it's "It were" but NOT preceded by "if", "wish", "suppose", etc.
+  const itWereRe = /(?<!\b(if|wish|suppose|that)\s+)\b(it|she|he)\b\s+(were)\b/gi;
+  for (const m of text.matchAll(itWereRe)) {
+    const start = m.index ?? 0;
+    const subject = m[2];
+    const verb = m[3];
+    const offset = start + subject.length + (m[0].length - subject.length - verb.length);
+
+    matches.push({
+      message: `Use "was" for indicative statements with "${subject}".`,
+      offset: start,
+      length: m[0].length,
+      replacements: [{ value: `${subject} was` }]
+    });
+  }
+
+  return matches;
+}
+
 // ------------------------- Grammar engine (Hybrid) ----------------------------
 
 async function getSuggestionsFromLT(text: string, language = "en-US"): Promise<any[]> {
@@ -111,6 +134,9 @@ async function getSuggestionsForParagraph(
   // 1. Fetch from LanguageTool
   const ltMatches = await getSuggestionsFromLT(paragraphText);
 
+  // 2. Local Fallbacks (for cases where the free API is over-cautious)
+  const localMatches = getLocalGrammarSuggestions(paragraphText);
+
   // Map Slate nodes to calculate absolute offsets correctly
   const paragraphTextNodes: Array<{ path: Path; text: string; start: number; end: number }> = [];
   let currentOffset = 0;
@@ -125,8 +151,10 @@ async function getSuggestionsForParagraph(
     currentOffset += text.length;
   }
 
-  // Process LT matches: Split them across text nodes if they span multiple
-  for (const match of ltMatches) {
+  // Process all matches (API + Local)
+  const allMatches = [...ltMatches, ...localMatches];
+
+  for (const match of allMatches) {
     const mStart = match.offset;
     const mEnd = match.offset + match.length;
     const suggestionId = uid();
