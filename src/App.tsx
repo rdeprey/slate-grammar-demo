@@ -14,6 +14,7 @@ import {
 } from "slate";
 import { Slate, Editable, ReactEditor, RenderLeafProps, withReact } from "slate-react";
 import { withHistory, HistoryEditor } from "slate-history";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 declare module "slate" {
   interface CustomTypes {
@@ -53,6 +54,7 @@ type CustomRule = {
   pattern: string; // The regex pattern
   message: string;
   replacement: string;
+  xml?: string;
 };
 
 const initialValue: Descendant[] = [
@@ -127,11 +129,18 @@ function getLocalGrammarSuggestions(text: string, customRules: CustomRule[] = []
 
 // ------------------------- Grammar engine (Hybrid) ----------------------------
 
-async function getSuggestionsFromLT(text: string, language = "en-US"): Promise<any[]> {
+async function getSuggestionsFromLT(
+  text: string,
+  language = "en-US",
+  disabledCategories: string[] = []
+): Promise<any[]> {
   try {
     const params = new URLSearchParams();
     params.append("text", text);
     params.append("language", language);
+    if (disabledCategories.length > 0) {
+      params.append("disabledCategories", disabledCategories.join(","));
+    }
 
     const response = await fetch("https://api.languagetool.org/v2/check", {
       method: "POST",
@@ -149,17 +158,24 @@ async function getSuggestionsForParagraph(
   editor: Editor,
   paragraphPath: Path,
   selection: Range | null,
-  customRules: CustomRule[] = []
+  customRules: CustomRule[] = [],
+  settings: Record<string, boolean> = {}
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const paragraphText = Node.string(Node.get(editor, paragraphPath));
   if (!paragraphText.trim()) return [];
 
   // 1. Fetch from LanguageTool
-  const ltMatches = await getSuggestionsFromLT(paragraphText);
+  const disabledLTCategories = [];
+  if (!settings.ltTypos) disabledLTCategories.push("TYPOS");
+  if (!settings.ltGrammar) disabledLTCategories.push("GRAMMAR");
+  if (!settings.ltStyle) disabledLTCategories.push("STYLE");
+  if (!settings.ltPunctuation) disabledLTCategories.push("PUNCTUATION");
+
+  const ltMatches = await getSuggestionsFromLT(paragraphText, "en-US", disabledLTCategories);
 
   // 2. Local & Custom Rules
-  const localMatches = getLocalGrammarSuggestions(paragraphText, customRules);
+  const localMatches = settings.localFallbacks ? getLocalGrammarSuggestions(paragraphText, customRules) : [];
 
   // Map Slate nodes to calculate absolute offsets correctly
   const paragraphTextNodes: Array<{ path: Path; text: string; start: number; end: number }> = [];
@@ -204,7 +220,7 @@ async function getSuggestionsForParagraph(
   }
 
   // 2. Add local POV propagation (High priority for this demo)
-  const targetPOV = selection ? inferTargetPOV(editor, paragraphPath, selection) : null;
+  const targetPOV = selection && settings.povPropagation ? inferTargetPOV(editor, paragraphPath, selection) : null;
   if (targetPOV) {
     for (const node of paragraphTextNodes) {
       suggestions.push(...getPOVPropagationSuggestions(node.text, node.path, targetPOV));
@@ -403,11 +419,13 @@ function Leaf({ attributes, children, leaf }: RenderLeafProps) {
   const l = leaf as DecoratedText;
 
   if (l.suggestionId) {
-    const kind = l.suggestionKind ?? "repeat-word";
+    const kind = l.suggestionKind;
+    const isPOV = kind === "pov-pronoun-propagation";
+
     const style: React.CSSProperties = {
       textDecoration: "underline",
-      textDecorationStyle: "wavy",
-      textDecorationColor: kind === "grammar" ? "#ff4d4f" : "#13c2c2",
+      textDecorationStyle: isPOV ? "dashed" : "wavy",
+      textDecorationColor: isPOV ? "#13c2c2" : "#ff4d4f",
       cursor: "pointer",
     };
 
@@ -427,10 +445,20 @@ export default function App() {
   const editor = useMemo(() => withHistory(withReact(createEditor() as ReactEditor)), []);
   const [value, setValue] = useState<Descendant[]>(initialValue);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [povSuggestions, setPovSuggestions] = useState<Suggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [customRules, setCustomRules] = useState<CustomRule[]>([]);
   const [ruleIntent, setRuleIntent] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [ruleSettings, setRuleSettings] = useState({
+    ltTypos: true,
+    ltGrammar: true,
+    ltStyle: true,
+    ltPunctuation: true,
+    povPropagation: true,
+    localFallbacks: true,
+  });
 
   // Keep a tiny debounce so it doesn't recompute on every single keystroke.
   const debounceRef = useRef<number | null>(null);
@@ -455,12 +483,18 @@ export default function App() {
     setLoading(true);
     try {
       const [, paragraphPath] = paragraphEntry;
-      const next = await getSuggestionsForParagraph(editor, paragraphPath, selection, customRules);
-      setSuggestions(next);
+      const all = await getSuggestionsForParagraph(editor, paragraphPath, selection, customRules, ruleSettings);
+
+      // Gate POV suggestions: Separate from immediate underlines
+      const immediate = all.filter(s => s.kind !== "pov-pronoun-propagation");
+      const gated = all.filter(s => s.kind === "pov-pronoun-propagation");
+
+      setSuggestions(immediate);
+      setPovSuggestions(gated);
     } finally {
       setLoading(false);
     }
-  }, [editor]);
+  }, [editor, customRules]);
 
   const scheduleRecompute = useCallback(() => {
     if (debounceRef.current) window.clearTimeout(debounceRef.current);
@@ -474,7 +508,9 @@ export default function App() {
       const ranges: Range[] = [];
       if (!Text.isText(node)) return ranges;
 
-      for (const s of suggestions) {
+      const all = [...suggestions, ...povSuggestions];
+
+      for (const s of all) {
         if (Path.equals(s.path, path)) {
           ranges.push({
             ...s.range,
@@ -485,7 +521,7 @@ export default function App() {
       }
       return ranges;
     },
-    [suggestions]
+    [suggestions, povSuggestions]
   );
 
   const applySuggestion = useCallback(
@@ -498,6 +534,26 @@ export default function App() {
     },
     [editor, recomputeSuggestions]
   );
+
+  const applyAllPOVSuggestions = useCallback(() => {
+    if (povSuggestions.length === 0) return;
+
+    Editor.withoutNormalizing(editor, () => {
+      // Apply in reverse order to keep offsets valid if they were in the same node
+      // but since they are distinct tokens, we can just apply them.
+      // Better: Sort by path and offset descending
+      const sorted = [...povSuggestions].sort((a, b) => {
+        const pathCompare = Path.compare(a.path, b.path);
+        if (pathCompare !== 0) return -pathCompare;
+        return b.range.anchor.offset - a.range.anchor.offset;
+      });
+
+      for (const s of sorted) {
+        Transforms.insertText(editor, s.replacement, { at: s.range });
+      }
+    });
+    recomputeSuggestions();
+  }, [editor, povSuggestions, recomputeSuggestions]);
 
   const getSuggestionAtCursor = useCallback((): Suggestion | null => {
     const { selection } = editor;
@@ -554,48 +610,94 @@ export default function App() {
     if (!ruleIntent.trim()) return;
     setIsGenerating(true);
 
-    // Simulate LLM Generation
-    // In a real app, this would be: 
-    // const res = await fetch("/api/generate-rule", { method: "POST", body: { intent: ruleIntent } })
-    await new Promise(r => setTimeout(r, 800));
+    try {
+      let newRule: CustomRule;
 
-    let generatedPattern = "";
-    let message = "";
-    let replacement = "";
+      if (apiKey) {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const lower = ruleIntent.toLowerCase();
-    if (lower.includes("avoid") || lower.includes("never use") || lower.includes("ban")) {
-      const match = ruleIntent.match(/(?:avoid|use|ban)\W+(['"])?(\w+)\1/i) || ruleIntent.match(/(?:avoid|use|ban)\W+(\w+)/i);
-      const word = match ? match[2] || match[1] : "word";
-      generatedPattern = `\\b${word}\\b`;
-      message = `Style Guide: Avoid using the word "${word}".`;
-    } else if (lower.includes("replace") || lower.includes("instead of")) {
-      const words = ruleIntent.match(/replace\s+(\w+)\s+with\s+(\w+)/i);
-      if (words) {
-        generatedPattern = `\\b${words[1]}\\b`;
-        message = `Style Guide: Use "${words[2]}" instead of "${words[1]}".`;
-        replacement = words[2];
+        const prompt = `
+          You are a LanguageTool Rule Specialist. 
+          Convert the following user intent into a structured JSON rule for a custom grammar checker.
+          The user wants to: "${ruleIntent}"
+          
+          Return ONLY a JSON object with this structure:
+          {
+            "pattern": "A JavaScript-ready Regex string (as a string literal, handle escapes carefully) that matches the error",
+            "message": "The human readable explanation of the error",
+            "replacement": "The suggested replacement word (optional)",
+            "xml": "The LanguageTool XML <rule> format for this pattern"
+          }
+
+          Rules for Regex:
+          - Use \\\\b for word boundaries (double escape for JSON string).
+          - The regex should match the ERROR, not the correction.
+          
+          Rules for XML:
+          - Use <rule>, <pattern>, <token>, <message>, <suggestion> tags.
+          - Example: <rule id="ID" name="NAME"><pattern><token>word</token></pattern><message>Reason</message><suggestion>better</suggestion></rule>
+        `;
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+        const cleaned = text.replace(/```json|```/g, "").trim();
+        const parsed = JSON.parse(cleaned);
+
+        newRule = {
+          id: uid(),
+          intent: ruleIntent,
+          pattern: parsed.pattern,
+          message: parsed.message,
+          replacement: parsed.replacement || "",
+          xml: parsed.xml
+        };
       } else {
-        generatedPattern = `\\bword\\b`;
-        message = "Custom style rule triggered.";
+        // Fallback to simple regex if no API key
+        await new Promise((r) => setTimeout(r, 600));
+        let generatedPattern = "";
+        let message = "";
+        let replacement = "";
+
+        const lower = ruleIntent.toLowerCase();
+        if (lower.includes("avoid") || lower.includes("never use") || lower.includes("ban")) {
+          const match = ruleIntent.match(/(?:avoid|use|ban)\W+(['"])?(\w+)\1/i) || ruleIntent.match(/(?:avoid|use|ban)\W+(\w+)/i);
+          const word = match ? match[2] || match[1] : "word";
+          generatedPattern = `\\b${word}\\b`;
+          message = `Style Guide: Avoid using the word "${word}".`;
+        } else if (lower.includes("replace") || lower.includes("instead of")) {
+          const words = ruleIntent.match(/replace\s+(\w+)\s+with\s+(\w+)/i);
+          if (words) {
+            generatedPattern = `\\b${words[1]}\\b`;
+            message = `Style Guide: Use "${words[2]}" instead of "${words[1]}".`;
+            replacement = words[2];
+          } else {
+            generatedPattern = `\\bword\\b`;
+            message = "Custom style rule triggered.";
+          }
+        } else {
+          generatedPattern = `\\b${ruleIntent.split(" ").pop()}\\b`;
+          message = `Custom Rule: ${ruleIntent}`;
+        }
+
+        newRule = {
+          id: uid(),
+          intent: ruleIntent,
+          pattern: generatedPattern,
+          message,
+          replacement,
+        };
       }
-    } else {
-      generatedPattern = `\\b${ruleIntent.split(' ').pop()}\\b`;
-      message = `Custom Rule: ${ruleIntent}`;
+
+      setCustomRules((prev) => [...prev, newRule]);
+      setRuleIntent("");
+    } catch (error) {
+      console.error("Failed to generate rule:", error);
+      alert("Error generating rule. Please check your API key or intent.");
+    } finally {
+      setIsGenerating(false);
+      recomputeSuggestions();
     }
-
-    const newRule: CustomRule = {
-      id: uid(),
-      intent: ruleIntent,
-      pattern: generatedPattern,
-      message,
-      replacement
-    };
-
-    setCustomRules(prev => [...prev, newRule]);
-    setRuleIntent("");
-    setIsGenerating(false);
-    recomputeSuggestions();
   };
 
   const removeRule = (id: string) => {
@@ -636,6 +738,42 @@ export default function App() {
           />
         </Slate>
       </div>
+
+      {povSuggestions.length > 0 && (
+        <div style={{
+          marginTop: 12,
+          padding: "10px 16px",
+          background: "#e6fffb",
+          border: "1px solid #87e8de",
+          borderRadius: 8,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          animation: "fadeIn 0.3s ease-out"
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 18 }}>✨</span>
+            <span style={{ fontSize: 14, color: "#006d75" }}>
+              <b>POV Shift Detected:</b> Alignment issues found with {povSuggestions.length} pronouns in this paragraph.
+            </span>
+          </div>
+          <button
+            onClick={applyAllPOVSuggestions}
+            style={{
+              background: "#13c2c2",
+              color: "white",
+              border: "none",
+              padding: "6px 14px",
+              borderRadius: 6,
+              cursor: "pointer",
+              fontSize: 13,
+              fontWeight: "600"
+            }}
+          >
+            Align Paragraph
+          </button>
+        </div>
+      )}
 
       <div style={{ marginTop: 14 }}>
         <b>Suggestions</b> <span style={{ opacity: 0.65 }}>({suggestions.length})</span>
@@ -678,59 +816,113 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{ marginTop: 24, padding: 16, background: "#f9f9f9", borderRadius: 12, border: "1px solid #eee" }}>
-        <h3 style={{ marginTop: 0 }}>AI Style Guide Generator</h3>
-        <p style={{ fontSize: 13, opacity: 0.7 }}>Describe a custom rule (e.g., "Avoid the word 'actually'" or "Replace 'utilize' with 'use'").</p>
-        <div style={{ display: "flex", gap: 10 }}>
-          <input
-            value={ruleIntent}
-            onChange={e => setRuleIntent(e.target.value)}
-            placeholder="Describe your rule..."
-            style={{ flex: 1, padding: "8px 12px", borderRadius: 8, border: "1px solid #ddd" }}
-          />
-          <button
-            onClick={handleAddRule}
-            disabled={isGenerating}
-            style={{
-              padding: "8px 16px",
-              borderRadius: 8,
-              border: "none",
-              background: "#13c2c2",
-              color: "white",
-              cursor: isGenerating ? "not-allowed" : "pointer"
-            }}
-          >
-            {isGenerating ? "Generating..." : "Generate Rule"}
-          </button>
+      <div style={{ marginTop: 24, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+        <div style={{ padding: 16, background: "#f0f2f5", borderRadius: 12, border: "1px solid #e8e8e8" }}>
+          <h3 style={{ marginTop: 0, fontSize: 16 }}>Core Rule Settings</h3>
+          <div style={{ display: "grid", gap: 10 }}>
+            <SettingToggle
+              label="Standard Typos"
+              tooltip="Spelling mistakes and common typos detected by LanguageTool."
+              checked={ruleSettings.ltTypos}
+              onChange={() => setRuleSettings(s => ({ ...s, ltTypos: !s.ltTypos }))}
+            />
+            <SettingToggle
+              label="Standard Grammar"
+              tooltip="Grammatical errors like subject-verb agreement, mismatched tenses, and article usage."
+              checked={ruleSettings.ltGrammar}
+              onChange={() => setRuleSettings(s => ({ ...s, ltGrammar: !s.ltGrammar }))}
+            />
+            <SettingToggle
+              label="Sentence Style"
+              tooltip="Suggestions for clarity, avoiding redundancy, and improving active voice."
+              checked={ruleSettings.ltStyle}
+              onChange={() => setRuleSettings(s => ({ ...s, ltStyle: !s.ltStyle }))}
+            />
+            <SettingToggle
+              label="Punctuation"
+              tooltip="Oxford commas, mismatched brackets/quotes, and spacing issues."
+              checked={ruleSettings.ltPunctuation}
+              onChange={() => setRuleSettings(s => ({ ...s, ltPunctuation: !s.ltPunctuation }))}
+            />
+            <div style={{ margin: "8px 0", borderTop: "1px solid #ddd" }} />
+            <SettingToggle
+              label="POV Propagation"
+              tooltip="Aligns pronouns in the paragraph to match the pronoun nearest your cursor (Local Engine)."
+              checked={ruleSettings.povPropagation}
+              onChange={() => setRuleSettings(s => ({ ...s, povPropagation: !s.povPropagation }))}
+            />
+            <SettingToggle
+              label="Language Fallbacks"
+              tooltip="Custom rules for subtle errors like 'It were' that the public API might skip (Local Engine)."
+              checked={ruleSettings.localFallbacks}
+              onChange={() => setRuleSettings(s => ({ ...s, localFallbacks: !s.localFallbacks }))}
+            />
+          </div>
         </div>
 
-        {customRules.length > 0 && (
-          <div style={{ marginTop: 16 }}>
-            <div style={{ fontSize: 12, fontWeight: "bold", opacity: 0.5, marginBottom: 8 }}>ACTIVE RULES</div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        <div style={{ padding: 16, background: "#f9f9f9", borderRadius: 12, border: "1px solid #eee" }}>
+          <h3 style={{ marginTop: 0, fontSize: 16 }}>AI Style Guide Generator</h3>
+          <p style={{ fontSize: 13, opacity: 0.7, marginBottom: 12 }}>
+            Describe a custom rule (e.g., "Avoid 'actually'").
+            {!apiKey && <span style={{ color: "#d48806" }}> (Add API Key for AI generation)</span>}
+          </p>
+
+          <div style={{ marginBottom: 12 }}>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={e => setApiKey(e.target.value)}
+              placeholder="Gemini API Key..."
+              style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: "1px solid #ddd", fontSize: 12, boxSizing: "border-box" }}
+            />
+          </div>
+
+          <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+            <input
+              value={ruleIntent}
+              onChange={e => setRuleIntent(e.target.value)}
+              placeholder="Describe your rule..."
+              style={{ flex: 1, padding: "8px 12px", borderRadius: 8, border: "1px solid #ddd" }}
+            />
+            <button
+              onClick={handleAddRule}
+              disabled={isGenerating}
+              style={{
+                padding: "8px 16px",
+                borderRadius: 8,
+                border: "none",
+                background: "#13c2c2",
+                color: "white",
+                cursor: isGenerating ? "not-allowed" : "pointer"
+              }}
+            >
+              {isGenerating ? "Gen" : "Add"}
+            </button>
+          </div>
+
+          {customRules.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ fontSize: 11, fontWeight: "bold", opacity: 0.5 }}>ACTIVE CUSTOM RULES</div>
               {customRules.map(rule => (
                 <div key={rule.id} style={{
                   background: "white",
                   border: "1px solid #ddd",
-                  borderRadius: 16,
-                  padding: "4px 12px",
-                  fontSize: 13,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8
+                  borderRadius: 8,
+                  padding: "8px",
+                  fontSize: 12,
                 }}>
-                  <span>{rule.intent}</span>
-                  <button
-                    onClick={() => removeRule(rule.id)}
-                    style={{ border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 16, lineHeight: 1, opacity: 0.5 }}
-                  >
-                    ×
-                  </button>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontWeight: "bold" }}>{rule.intent}</span>
+                    <button
+                      onClick={() => removeRule(rule.id)}
+                      style={{ border: "none", background: "none", cursor: "pointer", opacity: 0.5 }}
+                    >×</button>
+                  </div>
                 </div>
               ))}
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       <details style={{ marginTop: 24 }}>
@@ -743,5 +935,47 @@ export default function App() {
         high-confidence “POV change” detection) to avoid changing pronouns that refer to different characters.
       </p>
     </div>
+  );
+}
+
+function SettingToggle({
+  label,
+  tooltip,
+  checked,
+  onChange
+}: {
+  label: string;
+  tooltip?: string;
+  checked: boolean;
+  onChange: () => void
+}) {
+  return (
+    <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", fontSize: 13 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span>{label}</span>
+        {tooltip && (
+          <span
+            title={tooltip}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: 14,
+              height: 14,
+              borderRadius: "50%",
+              background: "#ddd",
+              color: "#666",
+              fontSize: 10,
+              fontWeight: "bold",
+              fontStyle: "italic",
+              cursor: "help"
+            }}
+          >
+            i
+          </span>
+        )}
+      </div>
+      <input type="checkbox" checked={checked} onChange={onChange} style={{ cursor: "pointer" }} />
+    </label>
   );
 }
